@@ -270,11 +270,253 @@ When writing the server-side route that calls this API, you MUST:
 
 ---
 
-## Step 6: Poll Payment Status
+## Step 6: Choose Your Confirmation Strategy
 
-After opening the checkout URL for the user, poll to know when they've paid.
+After the checkout intent is created and the user opens `checkout_url`, you need to know when payment confirms so you can deliver the goods (unlock content, send the digital file, generate the AI reading, etc.). There are two ways:
+
+| Strategy | When to use | Pros | Cons |
+|---|---|---|---|
+| **Webhook (recommended)** | Any backend that can expose a public HTTPS endpoint — chat bots, mobile-app backends, web apps with a server, SaaS | Real-time, ~1s latency, zero wasted requests, scales to thousands of concurrent intents, no client polling cost | Needs a publicly reachable URL; needs idempotency / nonce store |
+| **Polling (fallback)** | Static sites, single-page apps with no backend, prototypes, environments behind NAT with no public URL | Simple to implement, works anywhere with outbound HTTPS | Wastes requests, slower (5s polling interval), client-side timer ties up the user's browser |
+
+**Default to webhooks.** Tell the developer: "If your app has a backend that can expose a public HTTPS endpoint, use webhooks (Step 7). Polling (Step 8) is the simpler fallback for static sites or quick prototypes."
+
+If the developer is unsure, ask:
+1. **"Do you have a backend, or is this a static page / SPA only?"** → Backend = Step 7. Static = Step 8.
+2. **"Can you expose a public HTTPS URL? (Vercel/Railway/Fly/Render all do this. Localhost needs `ngrok` or `cloudflared` during development.)"** → Yes = Step 7. No = Step 8.
+
+---
+
+## Step 7: Webhook (Recommended)
+
+Configure a webhook URL in your Allscale dashboard. Allscale sends a `POST` to that URL the moment payment is confirmed on-chain.
+
+### Webhook headers Allscale sends:
+
+| Header | Description |
+|---|---|
+| `X-API-Key` | Your API key (so you can match the right secret if you have multiple) |
+| `X-Webhook-Id` | Unique webhook ID — also present in the body, must match |
+| `X-Webhook-Timestamp` | Unix timestamp (seconds) |
+| `X-Webhook-Nonce` | Unique nonce — store and reject replays |
+| `X-Webhook-Signature` | `v1=<signature>` |
+
+### Webhook signature canonical string
+
+The canonical-string format for webhooks is **different** from regular API requests — note the literal prefix line `allscale:webhook:v1` at the top:
+
+```
+allscale:webhook:v1
+METHOD
+PATH
+QUERY_STRING
+WEBHOOK_ID
+TIMESTAMP
+NONCE
+BODY_SHA256
+```
+
+Then: `expected = Base64( HMAC-SHA256( api_secret, canonical ) )`
+
+Compare with **timing-safe equality** against the `v1=...` value in `X-Webhook-Signature`.
+
+### Webhook payload fields:
+
+| Field | Type | Description |
+|---|---|---|
+| `all_scale_transaction_id` | string | Allscale transaction ID |
+| `all_scale_checkout_intent_id` | string | Checkout intent ID — match this against your saved intent IDs |
+| `webhook_id` | string | Must match `X-Webhook-Id` header |
+| `amount_cents` | int | Fiat amount in cents |
+| `currency` | int | Currency enum |
+| `currency_symbol` | string | e.g., `"USD"` |
+| `amount_coins` | string | Stablecoin amount (decimal string) |
+| `coin_symbol` | string | e.g., `"USDT"` |
+| `chain_id` | int | EIP-155 chain ID |
+| `tx_hash` | string | On-chain transaction hash |
+| `tx_from` | string | Sender wallet address |
+| `order_id` | string or null | Your order ID (you set this in the checkout intent) |
+| `user_id` | string or null | Your user ID (you set this in the checkout intent) |
+
+### Reference implementation — Node.js (Express)
+
+```javascript
+import express from "express";
+import crypto from "crypto";
+
+const app = express();
+
+// IMPORTANT: capture the raw body for signature verification.
+// JSON re-serialization will produce a different SHA-256.
+app.post(
+  "/webhooks/allscale",
+  express.raw({ type: "application/json" }),
+  async (req, res) => {
+    const apiSecret = process.env.ALLSCALE_API_SECRET;
+    const rawBody = req.body.toString("utf8"); // raw bytes as string
+
+    const apiKey       = req.header("X-API-Key");
+    const webhookId    = req.header("X-Webhook-Id");
+    const timestamp    = req.header("X-Webhook-Timestamp");
+    const nonce        = req.header("X-Webhook-Nonce");
+    const signature    = req.header("X-Webhook-Signature");
+
+    if (!apiKey || !webhookId || !timestamp || !nonce || !signature) {
+      return res.status(400).send("missing headers");
+    }
+
+    // 1. Reject stale requests (±5 minute window)
+    const now = Math.floor(Date.now() / 1000);
+    if (Math.abs(now - parseInt(timestamp, 10)) > 300) {
+      return res.status(400).send("stale timestamp");
+    }
+
+    // 2. Reject replayed nonces (use Redis in production with TTL > 5 min)
+    if (await nonceStore.has(nonce)) {
+      return res.status(400).send("nonce replay");
+    }
+
+    // 3. Compute expected signature
+    const bodyHash = crypto.createHash("sha256").update(rawBody).digest("hex");
+    const canonical = [
+      "allscale:webhook:v1",
+      "POST",
+      "/webhooks/allscale",
+      "",                       // query string
+      webhookId,
+      timestamp,
+      nonce,
+      bodyHash,
+    ].join("\n");
+
+    const expected = "v1=" + crypto
+      .createHmac("sha256", apiSecret)
+      .update(canonical)
+      .digest("base64");
+
+    // 4. Timing-safe compare
+    const sigBuf = Buffer.from(signature);
+    const expBuf = Buffer.from(expected);
+    if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
+      return res.status(401).send("bad signature");
+    }
+
+    // 5. Mark nonce used (TTL = 10 min covers the ±5 min window)
+    await nonceStore.set(nonce, true, 600);
+
+    // 6. Now safe to parse + handle the event
+    const payload = JSON.parse(rawBody);
+    if (payload.webhook_id !== webhookId) {
+      return res.status(400).send("webhook_id mismatch");
+    }
+
+    await handlePayment(payload); // your business logic — fulfill the order
+
+    return res.status(200).send("ok");
+  }
+);
+```
+
+### Reference implementation — Python (Flask)
+
+```python
+import hmac, hashlib, base64, os, time, json
+from flask import Flask, request, abort
+
+app = Flask(__name__)
+API_SECRET = os.environ["ALLSCALE_API_SECRET"]
+
+@app.post("/webhooks/allscale")
+def allscale_webhook():
+    raw_body = request.get_data()  # raw bytes — DO NOT re-serialize
+    api_key   = request.headers.get("X-API-Key")
+    webhook_id = request.headers.get("X-Webhook-Id")
+    timestamp  = request.headers.get("X-Webhook-Timestamp")
+    nonce      = request.headers.get("X-Webhook-Nonce")
+    signature  = request.headers.get("X-Webhook-Signature")
+
+    if not all([api_key, webhook_id, timestamp, nonce, signature]):
+        abort(400, "missing headers")
+
+    # 1. Stale-timestamp check (±5 min)
+    if abs(int(time.time()) - int(timestamp)) > 300:
+        abort(400, "stale timestamp")
+
+    # 2. Nonce replay protection (use Redis in production)
+    if nonce_store.has(nonce):
+        abort(400, "nonce replay")
+
+    # 3. Compute expected signature
+    body_hash = hashlib.sha256(raw_body).hexdigest()
+    canonical = "\n".join([
+        "allscale:webhook:v1",
+        "POST",
+        "/webhooks/allscale",
+        "",                # query string
+        webhook_id,
+        timestamp,
+        nonce,
+        body_hash,
+    ])
+    expected = "v1=" + base64.b64encode(
+        hmac.new(API_SECRET.encode(), canonical.encode(), hashlib.sha256).digest()
+    ).decode()
+
+    # 4. Timing-safe compare
+    if not hmac.compare_digest(expected, signature):
+        abort(401, "bad signature")
+
+    # 5. Mark nonce used
+    nonce_store.set(nonce, True, ttl_seconds=600)
+
+    # 6. Parse + handle
+    payload = json.loads(raw_body.decode())
+    if payload["webhook_id"] != webhook_id:
+        abort(400, "webhook_id mismatch")
+
+    handle_payment(payload)  # your business logic
+    return ("ok", 200)
+```
+
+### Verification checklist (always do all six)
+
+1. ✅ Timestamp within ±5 minutes of server time
+2. ✅ Nonce not seen before — store in Redis/Memcached/in-memory with TTL ≥ 10 min
+3. ✅ Body SHA-256 computed from **raw bytes** before any JSON parse / re-serialization
+4. ✅ Canonical string built with the literal `allscale:webhook:v1` prefix and `\n` separators
+5. ✅ Compared with **timing-safe** equality (never `===` / `==`)
+6. ✅ Respond with `200 OK` only after verification passes
+
+### Local development with webhooks
+
+To test webhooks before deploying, expose your local server with a tunnel:
+
+```bash
+# ngrok
+ngrok http 3000
+# → use the https URL as your webhook URL in the Allscale dashboard
+
+# or Cloudflare Tunnel
+cloudflared tunnel --url http://localhost:3000
+```
+
+Webhooks **must** be HTTPS — Allscale will not call HTTP endpoints. Both ngrok and cloudflared give you HTTPS for free.
+
+### Idempotency reminder
+
+Allscale may retry a webhook on transient failures. Make your handler idempotent:
+- Use the `all_scale_checkout_intent_id` as the dedupe key
+- If the intent is already marked paid in your DB, return `200 OK` without re-running fulfillment
+
+---
+
+## Step 8: Polling (Fallback)
+
+Use polling only if webhooks aren't an option (no backend, can't expose a public URL).
 
 ### Endpoint: `GET /v1/checkout_intents/{intent_id}/status`
+
+Sign this request the same way as Step 3 (regular API auth, not the webhook prefix).
 
 No request body. Returns:
 
@@ -303,76 +545,13 @@ No request body. Returns:
 
 **Recommended polling strategy:**
 - Poll every 5 seconds
-- Stop when status is terminal (negative values or 20)
+- Stop when status is terminal (negative values or `20`)
 - Timeout after 10 minutes
 - Show user-friendly messages for each state transition
 
 ### Full intent details (optional):
 
-`GET /v1/checkout_intents/{intent_id}` returns the complete object including `tx_hash`, `tx_from`, `actual_paid_amount`, etc.
-
----
-
-## Step 7: Webhook Verification (Optional but Recommended)
-
-If they configure a webhook URL in the Allscale dashboard, Allscale sends a POST to their server when payment is confirmed.
-
-### Webhook headers:
-
-| Header | Description |
-|---|---|
-| `X-API-Key` | API key |
-| `X-Webhook-Id` | Unique webhook ID |
-| `X-Webhook-Timestamp` | Unix timestamp |
-| `X-Webhook-Nonce` | Unique nonce |
-| `X-Webhook-Signature` | `v1=<signature>` |
-
-### Webhook signature verification:
-
-The canonical string format for webhooks is **different** from regular API requests:
-
-```
-allscale:webhook:v1
-METHOD
-PATH
-QUERY_STRING
-WEBHOOK_ID
-TIMESTAMP
-NONCE
-BODY_SHA256
-```
-
-Note the prefix line `allscale:webhook:v1` — this is NOT present in regular API signing.
-
-Then: `expected = Base64( HMAC-SHA256( api_secret, canonical ) )`
-
-Compare with timing-safe equality against the signature in the header.
-
-### Webhook payload fields:
-
-| Field | Type | Description |
-|---|---|---|
-| `all_scale_transaction_id` | string | Allscale transaction ID |
-| `all_scale_checkout_intent_id` | string | Checkout intent ID |
-| `webhook_id` | string | Must match X-Webhook-Id header |
-| `amount_cents` | int | Fiat amount in cents |
-| `currency` | int | Currency enum |
-| `currency_symbol` | string | e.g., "USD" |
-| `amount_coins` | string | Stablecoin amount (decimal string) |
-| `coin_symbol` | string | e.g., "USDT" |
-| `chain_id` | int | EIP-155 chain ID |
-| `tx_hash` | string | On-chain transaction hash |
-| `tx_from` | string | Sender wallet address |
-| `order_id` | string or null | Your order ID |
-| `user_id` | string or null | Your user ID |
-
-### Verification checklist:
-1. Validate timestamp is within ±5 minutes
-2. Check nonce hasn't been used before (store in Redis/memory with TTL)
-3. Compute body SHA-256 from **raw bytes before JSON parsing**
-4. Build canonical string and verify signature
-5. Only process payload after verification passes
-6. Respond with 200 OK
+`GET /v1/checkout_intents/{intent_id}` returns the complete object including `tx_hash`, `tx_from`, `actual_paid_amount`, etc. Useful for showing a payment receipt after confirmation.
 
 ---
 
@@ -404,11 +583,17 @@ If they get `20002` (bad signature), check these in order:
 
 ---
 
-## Working Example
+## Working Examples
 
-Point them to the Buy Me a Bagel repo (`allscale-io/buy_me_a_bagel`) as a complete working reference:
+| Example | Stack | Confirmation flow | Best for |
+|---|---|---|---|
+| [Buy Me a Bagel](https://github.com/allscale-io/buy_me_a_bagel) | Vanilla JS + Vercel serverless | **Polling** | Static donation/tipping pages, no backend |
+
+Buy Me a Bagel files to point at:
 - `api/checkout.js` — checkout intent creation with HMAC signing and rate limiting
 - `api/status.js` — status polling with signing
 - `app.js` — frontend checkout flow with status polling UI
+
+A webhook-first reference example is in active development. Until it ships, use the webhook code samples in **Step 7** of this skill as the canonical reference.
 
 API documentation: https://github.com/allscale-io/AllScale_Third-Party_API_Doc

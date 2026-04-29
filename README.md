@@ -48,8 +48,8 @@ The skill will:
    - HMAC-SHA256 request signing
    - Test route verification (confirm your setup works)
    - Checkout intent creation (the core payment flow)
-   - Payment status polling
-   - Webhook signature verification
+   - **Webhook implementation** — the recommended way to confirm payments (real-time, scales)
+   - Polling fallback for static sites and quick prototypes
 5. **Help you debug** if anything goes wrong (signature mismatches, enum issues, etc.)
 
 ---
@@ -69,9 +69,11 @@ This skill follows these rules to keep your credentials safe:
 
 - Full Allscale Checkout API authentication (HMAC-SHA256 signing)
 - Creating checkout intents (`POST /v1/checkout_intents/`)
-- Polling payment status (`GET /v1/checkout_intents/{id}/status`)
-- Webhook callback verification
+- **Webhook implementation** — recommended path for any app with a backend (chat bots, mobile-app backends, SaaS, web apps with a server)
+- **Polling fallback** (`GET /v1/checkout_intents/{id}/status`) — for static sites and prototypes with no backend
 - Currency enum mappings
+- Sandbox vs production environment switching
+- Local development with webhooks (ngrok / cloudflared)
 - Error code reference and debugging guide
 
 ---
@@ -79,7 +81,8 @@ This skill follows these rules to keep your credentials safe:
 ## Reference
 
 - [Allscale API Documentation](https://github.com/allscale-io/AllScale_Third-Party_API_Doc)
-- [Buy Me a Bagel](https://github.com/allscale-io/buy_me_a_bagel) — working example built with this integration
+- [Buy Me a Bagel](https://github.com/allscale-io/buy_me_a_bagel) — working example using **polling** (vanilla JS + Vercel serverless)
+- A webhook-first reference example is in active development. Until it ships, see Step 7 of the skill for canonical Node.js + Python webhook code.
 
 ## License
 
