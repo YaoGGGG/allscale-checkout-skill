@@ -87,7 +87,7 @@ This skill follows these rules to keep your credentials safe:
 
 ## Reference
 
-- [Allscale API Documentation](https://github.com/allscale-io/AllScale_Third-Party_API_Doc)
+- [Allscale API Documentation](https://docs.allscale.io/allscale-checkout/getting-started)
 - [Buy Me a Bagel](https://github.com/allscale-io/buy_me_a_bagel) — working example built with this integration
 
 ## License
